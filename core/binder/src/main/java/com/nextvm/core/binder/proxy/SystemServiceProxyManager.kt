@@ -68,6 +68,7 @@ class SystemServiceProxyManager @Inject constructor() {
         const val SERVICE_NSD = "servicediscovery"
         const val SERVICE_SEARCH = "search"
         const val SERVICE_SHORTCUT = "shortcut"
+        const val SERVICE_APPWIDGET = "appwidget"
         const val SERVICE_CROSS_PROFILE = "crossprofileapps"
         const val SERVICE_DEVICE_IDENTIFIERS = "device_identifiers_policy"
     }
@@ -217,6 +218,7 @@ class SystemServiceProxyManager @Inject constructor() {
         installMediaSessionProxy(context)
         installNetworkStatsProxy(context)
         installShortcutProxy(context)
+        installAppWidgetProxy(context)
         installWallpaperProxy(context)
 
         Timber.tag(TAG).i("Installed ${installedProxies.size} system service proxies")
@@ -236,6 +238,7 @@ class SystemServiceProxyManager @Inject constructor() {
             SERVICE_USAGE_STATS to { installUsageStatsProxy(context) },
             SERVICE_APP_OPS to { installAppOpsProxy(context) },
             SERVICE_USER to { installUserManagerProxy(context) },
+            SERVICE_APPWIDGET to { installAppWidgetProxy(context) },
         )
         val failedServices = allPossibleServices.filter { (name, _) -> name !in installedProxies }
 
@@ -3008,6 +3011,47 @@ internal class JobSchedulerProxyHandler(
     }
 
     /**
+     * AppWidget service proxy.
+     *
+     * Guest apps call AppWidgetManager.getAppWidgetIds(...) with THEIR package name, but the
+     * calling UID belongs to the host. system_server then throws
+     * "SecurityException: Package <guest> does not belong to <uid>" (this was crashing clones
+     * from a background thread). We retry the call using the host package, and if that still
+     * fails the generic safety net in BaseServiceProxy returns an empty result.
+     */
+    private fun installAppWidgetProxy(context: Context) {
+        installViaServiceManagerCache(
+            SERVICE_APPWIDGET,
+            "com.android.internal.appwidget.IAppWidgetService"
+        ) { original ->
+            object : BaseServiceProxy(original, this) {
+                override fun handleMethod(method: Method, args: Array<out Any>?, isVirtual: Boolean): Any? {
+                    return try {
+                        invokeOriginal(method, args)
+                    } catch (e: Throwable) {
+                        val cause = (e as? java.lang.reflect.InvocationTargetException)?.cause ?: e
+                        if (cause is SecurityException && args != null) {
+                            val newArgs = arrayOfNulls<Any>(args.size)
+                            for (i in args.indices) {
+                                val a = args[i]
+                                newArgs[i] = when (a) {
+                                    is String -> VirtualConstants.HOST_PACKAGE
+                                    is android.content.ComponentName ->
+                                        android.content.ComponentName(VirtualConstants.HOST_PACKAGE, a.className)
+                                    else -> a
+                                }
+                            }
+                            method.invoke(original, *newArgs)
+                        } else {
+                            throw e
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
      * Wallpaper service proxy — allow guest apps to get wallpaper info.
      */
     private fun installWallpaperProxy(context: Context) {
@@ -3056,7 +3100,51 @@ internal class JobSchedulerProxyHandler(
             }
 
             val isVirtual = manager.isVirtualApp(android.os.Process.myPid())
-            return handleMethod(method, args, isVirtual)
+            return try {
+                handleMethod(method, args, isVirtual)
+            } catch (e: Throwable) {
+                val cause = (e as? java.lang.reflect.InvocationTargetException)?.cause ?: e
+                if (cause is SecurityException && isPackageUidMismatch(cause)) {
+                    // Guest package name does not match the host UID. Never crash the clone for this.
+                    Timber.tag("SysSvcProxy").w(
+                        "Ignored package/UID mismatch in ${method.declaringClass.simpleName}.${method.name}: ${cause.message}"
+                    )
+                    defaultValueFor(method.returnType)
+                } else if (cause is RuntimeException || cause is Error || cause is android.os.RemoteException) {
+                    throw cause
+                } else {
+                    throw e
+                }
+            }
+        }
+
+        private fun isPackageUidMismatch(e: SecurityException): Boolean {
+            val m = e.message ?: return false
+            return m.contains("does not belong to") ||
+                m.contains("not owned by") ||
+                m.contains("Unknown calling package")
+        }
+
+        private fun defaultValueFor(type: Class<*>): Any? {
+            return when {
+                type == Void.TYPE -> null
+                type == Boolean::class.javaPrimitiveType -> false
+                type == Int::class.javaPrimitiveType -> 0
+                type == Long::class.javaPrimitiveType -> 0L
+                type == Short::class.javaPrimitiveType -> 0.toShort()
+                type == Byte::class.javaPrimitiveType -> 0.toByte()
+                type == Float::class.javaPrimitiveType -> 0f
+                type == Double::class.javaPrimitiveType -> 0.0
+                type == Char::class.javaPrimitiveType -> '\u0000'
+                type.isArray -> java.lang.reflect.Array.newInstance(type.componentType, 0)
+                List::class.java.isAssignableFrom(type) -> ArrayList<Any?>()
+                type.name == "android.content.pm.ParceledListSlice" -> try {
+                    type.getConstructor(List::class.java).newInstance(ArrayList<Any?>())
+                } catch (_: Throwable) {
+                    null
+                }
+                else -> null
+            }
         }
 
         abstract fun handleMethod(method: Method, args: Array<out Any>?, isVirtual: Boolean): Any?
